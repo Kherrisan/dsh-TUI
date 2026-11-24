@@ -369,6 +369,92 @@ Using ChatGPT subscription tokens in third-party clients is subject to
 OpenAI’s terms. Full instructions and current boundaries:
 [Codex backend](docs/codex-backend.en.md).
 
+### Attach to a running Web Host (`--connect`)
+
+Watch and drive the same agent session as the official Web UI, from the
+terminal, without starting a second DSH core:
+
+```sh
+dsh web                                   # another shell; prints a launch URL
+dsh-tui --connect                         # paste that URL when asked
+dsh-tui --connect --resume <session-id>   # skip the picker
+```
+
+The launch link is read from the terminal without echo, so the token never
+enters argv, the environment, a log or a recovery record; it stays in memory for
+the life of the process. Only loopback `http://`/`https://` Hosts are accepted.
+`--connect` is mutually exclusive with `--backend`, and `--resume` must name an
+explicit Host session — local resume records belong to no remote Host. Without
+an id the Host's sessions are listed (`r` refreshes, `q` quits) and an empty
+list is retryable. A bad token, a missing session or an unavailable protocol is
+reported and returns to the list; connect mode never falls back to a local
+session, shell or filesystem, and it never starts a local Agent.
+
+The Host owns the turn: it runs the model, coordinates the queue and the
+interactions, and persists the session. dsh-TUI shows the transcript (history
+plus paging), streaming output and tool activity, run state, and sends text as
+queue/followup or steer. It also retracts queued messages, stops a turn and
+answers approvals and questions — an answer from either client settles once in
+the Host and closes the panel on the other. Drafts, the selected session and
+scroll position are per client.
+
+The queue is the Host's, so every queue action is a request the Host answers:
+retracting a queued message (Alt+Up) keeps the row on screen until the Host
+confirms it dropped its copy, and a refusal or a lost receipt leaves the row
+where it is. Alt+Up on a queued row edits it **in place** instead (the Host
+keeps the item and only its text changes: Enter applies, Esc puts your draft
+back), and Alt+S promotes the newest queued row to a steering message with the
+Host's own action. A row the Host already handed to the agent retires with a
+notice instead of coming back as a re-sendable draft, and a bounded log window
+that does not mention it is never taken as proof that it never ran. Stopping a
+turn uses the official cancel and therefore **keeps** the session's queued
+messages — including anything the Web UI queued — instead of deleting them; the
+notice says so. A submission whose receipt never arrived is reported as
+"outcome unknown" and reconciled against the Host's queue and durable log: it is
+not re-sent automatically, and only a submission the Host never received comes
+back as an editable draft.
+
+New sessions are created on the Host (`/new`), never locally: the directory is
+always a Host directory — the attached session's own cwd, a Host Workspace, or
+the Host's first-use default Workspace — and this machine's cwd is never sent.
+A Host that names no directory refuses instead of guessing. Rename (`/rename`)
+and fork (`/fork`) are Host operations too: rename lands in the Host log and
+shows on both ends, a fork names the Host session it created and leaves the
+original untouched, and a refusal (for example a session with no completed turn
+to fork from) keeps the current binding and says why. `/model` and `/effort`
+read the Host's own catalog and its resolved selection; a model the Host cannot
+route is refused there and the old binding stays.
+
+Slash commands are the Host's. The command panel lists what the attached
+session publishes (`compact`, `goal`, `plan`, `permission`, `export`,
+`feedback`, tagged `[Remote Web]`), and a typed line runs through the Host's own
+registry — a session-level local command of the same name steps aside, because
+the local one would act on this process. A name the Host does not know is
+reported as "no such command" and consumed: unknown slash text never becomes
+model input. Subagents show their Host ids from the session's durable catalog,
+their transcripts are read through the parent/child address the Host minted, and
+interrupting one is the Host's own request. Background jobs come from the Host's
+`job/registered`/`job/settled` records, so the jobs panel and the status count
+are the Host's truth, and stopping one is `job/kill`; quitting dsh-TUI leaves
+them alone.
+
+Files and images split by owner. An image you attach is read here, in this
+process, and sent as the Host's inline image part; an image that cannot be read
+refuses the submission before anything leaves. `@` completion, the file listing
+and the read-only preview read the **attached session's** directory through the
+Host's file API, never this machine's cwd, and a path outside that directory is
+refused rather than resolved locally. Images the Host stored are read back by
+their durable reference inside the session's scope. `/terminals` lists the
+terminals the Host owns for the session, but it is read-only: dsh-TUI does not
+attach to one, does not type into one and never starts a shell on the Host, so
+terminal attach, output and input are not part of this version.
+
+Not in this version: plain (non-image) file attachments, terminal attach,
+subagent prompt delivery and live job output. A disconnect keeps the screen and
+reconnects with a fresh cookie and a new baseline; a prompt whose receipt was
+lost stays a draft and is never re-sent automatically. Closing dsh-TUI only
+releases its own connection — it never cancels a turn on the Host.
+
 ### DSH Agent Teams
 
 DSH Agent Teams lets the session's agent (the Lead) delegate to named

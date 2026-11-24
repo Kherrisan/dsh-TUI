@@ -53,6 +53,71 @@ export function createCapabilityDelegates(deps: {
       const index = list.findIndex(mode => mode.id === modes.current())
       await modes.set(list[(index + 1) % list.length]!.id)
     }),
+    /**
+     * A slash line the local catalog does not own, run by the session's own
+     * registry (the remote Host's). `undefined` means this backend has no such
+     * registry, so the caller keeps its ordinary "send it to the model" path;
+     * an unknown command on a backend that HAS one is an error the caller
+     * reports and consumes — the line is never model text.
+     */
+    runBackendCommand: (name, rawInput) => guarded('command', undefined, async () => {
+      const commands = caps().commands
+      const execute = commands?.execute
+      if (execute === undefined) return undefined
+      const line = rawInput === '' ? `/${name}` : `/${name} ${rawInput}`
+      let outcome
+      try {
+        outcome = await execute(line)
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error)
+        return { kind: 'error' as const, text: reason, consumeDraft: false }
+      }
+      if (outcome.kind === 'unknown') {
+        return { kind: 'error' as const, text: t('command-not-found', { name }), consumeDraft: true }
+      }
+      if (outcome.kind === 'failed') {
+        return { kind: 'error' as const, text: outcome.reason, consumeDraft: false }
+      }
+      if (outcome.error === true) {
+        return { kind: 'error' as const, text: outcome.text, consumeDraft: false }
+      }
+      return { kind: 'success' as const, text: outcome.text, consumeDraft: true }
+    }),
+    /**
+     * Read-only inventory of the terminals the Host owns for this session.
+     * Nothing here attaches, starts or types into a terminal: the Host's
+     * terminal stream and input frames are a separate (unimplemented) path.
+     */
+    describeHostTerminals: () => guarded('terminal', undefined, async () => {
+      const terminals = deps.session().capabilities.terminals
+      if (terminals === undefined) return undefined
+      const lines: string[] = []
+      const environment = await terminals.environment()
+      const inventory = await terminals.list()
+      if (inventory.length === 0) {
+        lines.push(t('terminals-none'))
+      } else {
+        for (const terminal of inventory) {
+          const size = terminal.cols > 0 && terminal.rows > 0 ? `${terminal.cols}x${terminal.rows}` : ''
+          const exit = terminal.exitCode === undefined || terminal.exitCode === null ? '' : ` (${terminal.exitCode})`
+          lines.push(
+            `${terminal.title}  [${terminal.state}${exit}]  ${terminal.origin}  ${[size, terminal.cwd].filter(part => part !== '').join('  ')}`.trim(),
+          )
+        }
+      }
+      if (environment !== undefined) {
+        lines.push(t('terminals-environment', {
+          cwd: environment.cwd,
+          cols: environment.maxCols,
+          rows: environment.maxRows,
+          scrollback: environment.scrollback,
+        }))
+      }
+      const shells = await terminals.shells()
+      if (shells.length > 0) lines.push(t('terminals-shells', { names: shells.map(shell => shell.name).join(', ') }))
+      lines.push(t('terminals-readonly'))
+      return lines
+    }),
     listModels: () => guarded('model', [], async () => {
       const session = deps.session()
       const models = session.capabilities.models

@@ -74,8 +74,18 @@ export interface AgentSession {
   /** A refusal may also say `dropped`: the backend is certain it never ran
    *  the input, so the channel keeps the text as a held row instead of losing
    *  it (#1651). Absent means the usual refusal handling (a preview retired
-   *  with a notice). */
-  submit(input: AgentInput, placement: SubmitPlacement): Promise<{ readonly accepted: boolean; readonly reason?: string; readonly dropped?: boolean }>
+   *  with a notice).
+   *
+   *  `outcome: 'unknown'` separates "the backend refused" from "the request
+   *  may or may not have landed" (a transport failure after sending). The
+   *  channel keeps such a row in place — not as a re-sendable draft — until
+   *  the backend reconciles it against its durable log and queue. */
+  submit(input: AgentInput, placement: SubmitPlacement): Promise<{
+    readonly accepted: boolean
+    readonly reason?: string
+    readonly dropped?: boolean
+    readonly outcome?: 'accepted' | 'rejected' | 'unknown'
+  }>
   /** Cancel the running turn. An `interrupt` also asks the backend to drop
    *  its queued inputs; the receipt says which copies are still live. A
    *  receipt whose `outcome` is not `confirmed` must never be read as an

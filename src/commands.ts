@@ -93,6 +93,7 @@ export const LOCAL_COMMANDS: LocalCommand[] = [
   { name: 'agents', description: 'Show subagents of this session' },
   { name: 'team', description: "Agent Teams: show status or switch this session's team (on/off)" },
   { name: 'jobs', description: 'Show background jobs of this session' },
+  { name: 'terminals', description: 'List the Host terminals of this session (read-only)' },
   { name: 'panel', description: 'Side panel: toggle / focus / zoom / switch panels' },
   // Model / display
   { name: 'activity', description: 'Switch the working-activity indicator preset' },

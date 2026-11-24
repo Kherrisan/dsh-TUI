@@ -81,11 +81,101 @@ const PROFILE = 'dsh-tui'
 /** 内置内核：只用于文案（"内置 dsh / claude / codex"）与 rescue/safe 提示。
  *  **不是校验来源**——插件后端由各自 profile 提供，启动器看不到，所以
  *  `--backend` 只做 id 语法校验（P0 D1）。 */
-const BUILTIN_BACKEND_IDS = ['dsh', 'claude', 'codex']
+const BUILTIN_BACKEND_IDS = ['dsh', 'claude', 'codex', 'remote']
 /** 后端 id 语法，与 src/agent/backend-manifest.ts 的 BACKEND_ID_PATTERN 同一规则
  *  （启动器要能在没有编译产物时工作，所以这里是副本；两边改动必须同步）。 */
 const BACKEND_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,31}$/
 const isBackendIdSyntax = value => typeof value === 'string' && BACKEND_ID_PATTERN.test(value)
+
+/** DSH's own leading flags: a start carrying one belongs to `dsh --profile`,
+ *  never to `--connect` (the launcher must not re-route it). Kept inline so the
+ *  launcher stays free of lib/ imports. */
+const DSH_HOST_ARG = /^(?:--profile|--from-default-profile|--patch|--dump-config|--dump-default-config|--dump-config-schema|-V|--version)(?:=|$)/
+const isDshHostArg = arg => DSH_HOST_ARG.test(arg)
+
+/**
+ * Decide (and validate) a `--connect` launch before anything else runs.
+ *
+ * Connect mode attaches to a Web Host someone else already runs: it needs no
+ * local profile bootstrap, no kernel and no Agent, and it must never fall back
+ * to a local session. The launch link itself is never an argument — the entry
+ * reads it without echo and keeps the token in memory.
+ *
+ * @param {string[]} argv - Raw launcher arguments.
+ * @returns {{ resumeId: string | undefined } | undefined} The plan, or
+ *   `undefined` when this is an ordinary launch. Exits on a bad combination.
+ */
+const planConnectLaunch = argv => {
+  let requested = process.env.DSH_TUI_CONNECT === '1'
+  let backend
+  let resumeId
+  let resumeKind = ''
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]
+    if (arg === '--') break
+    if (arg.startsWith('--connect=')) {
+      console.error(lang === 'zh' ? '--connect 不接受值：启动后会提示粘贴 Web 启动链接' : '--connect takes no value: the launch link is read from the terminal after start')
+      process.exit(2)
+    }
+    if (arg === '--connect') {
+      requested = true
+      // The link is pasted after start. A bare value here is *not* a flag, so
+      // the entry would read it as the initial prompt and submit the launch
+      // token into the session log — refuse the shape instead.
+      const next = argv[i + 1]
+      if (next !== undefined && !next.startsWith('-')) {
+        console.error(lang === 'zh'
+          ? '--connect 不接受值：启动后会提示粘贴 Web 启动链接（不要把链接当参数）'
+          : '--connect takes no value: the launch link is read from the terminal after start (do not pass it as an argument)')
+        process.exit(2)
+      }
+      continue
+    }
+    if (arg === '--backend' || arg.startsWith('--backend=')) {
+      backend = arg.startsWith('--backend=') ? arg.slice('--backend='.length).trim() : (argv[i + 1] ?? '').trim()
+      if (arg === '--backend' && argv[i + 1] !== undefined) i += 1
+      continue
+    }
+    if (arg === '--resume' || arg.startsWith('--resume=')) {
+      if (arg.startsWith('--resume=')) {
+        resumeId = arg.slice('--resume='.length).trim() || undefined
+        resumeKind = resumeId === undefined ? 'bare' : 'explicit'
+      } else if (argv[i + 1] !== undefined && !argv[i + 1].startsWith('-')) {
+        resumeId = argv[++i].trim() || undefined
+        resumeKind = resumeId === undefined ? 'bare' : 'explicit'
+      } else {
+        resumeKind = 'bare'
+      }
+      continue
+    }
+    if (arg === '-c' || arg === '--continue') resumeKind = 'continue'
+  }
+  if (!requested) {
+    // `--backend remote` is not a launch on its own: the backend exists only to
+    // attach, so refuse before the thin shell would bootstrap a profile for it.
+    if (backend === 'remote') {
+      console.error(lang === 'zh' ? 'remote 后端只能由 --connect 启动：请改用 dsh-tui --connect' : 'The remote backend starts only through --connect: use dsh-tui --connect')
+      process.exit(2)
+    }
+    return undefined
+  }
+  if (backend !== undefined && backend !== 'remote') {
+    console.error(lang === 'zh' ? '--connect 与 --backend 互斥：连接模式只会附加到远端 Web 会话' : '--connect and --backend are mutually exclusive: connect mode only attaches to a remote Web session')
+    process.exit(2)
+  }
+  if (resumeKind === 'bare' || resumeKind === 'continue') {
+    console.error(lang === 'zh'
+      ? '连接模式下 --resume 必须写明远端会话 id，且不支持 --continue（本地恢复记录不属于远端 Host）'
+      : 'In connect mode --resume needs an explicit remote session id, and --continue is not supported (local resume records belong to no remote Host)')
+    process.exit(2)
+  }
+  process.env.DSH_TUI_BACKEND = 'remote'
+  process.env.DSH_TUI_CONNECT = '1'
+  // Keep the entry on the remote kernel without letting the profile still
+  // claim the launch: the entry reads the symbol-keyed handoff, not argv.
+  if (resumeId !== undefined) process.env.DSH_TUI_RESUME_SESSION = resumeId
+  return { resumeId }
+}
 
 // 随包用户手册（guide/，见 scripts/build-guide.mjs）：交给 dsh 当内核
 // dsh-skill-filesystem 的随包技能根（rank 600 的 bundledSkillDir 默认取这个
@@ -552,7 +642,8 @@ const MSG = {
       `Options:\n` +
       `  --resume [id]          Resume the last (or the given) session\n` +
       `  -c, --continue         Same as --resume\n` +
-      `  --backend <id>         Agent backend: dsh | claude | codex, or an installed plugin backend\n` +
+      `  --backend <id>         Agent backend: dsh | claude | codex | remote, or an installed plugin backend\n` +
+      `  --connect              Attach to a running DSH Web Host (paste its launch URL)\n` +
       `                         (claude, codex and plugin backends: experimental)\n` +
       `  -- <prompt...>        Treat the remaining arguments as literal prompt text\n` +
       `  <path|url>             Open with the given workspace target\n\n` +
@@ -574,7 +665,8 @@ const MSG = {
       `选项：\n` +
       `  --resume [id]          恢复上次（或指定 id 的）会话\n` +
       `  -c, --continue         同 --resume\n` +
-      `  --backend <id>         Agent 后端：dsh | claude | codex，或已安装的插件后端\n` +
+      `  --backend <id>         Agent 后端：dsh | claude | codex | remote，或已安装的插件后端\n` +
+      `  --connect              附加到运行中的 DSH Web Host（启动后粘贴启动链接）\n` +
       `                         （claude、codex 与插件后端均为实验性）\n` +
       `  -- <提示词...>         将剩余参数作为字面提示词\n` +
       `  <路径|URL>             以指定工作区目标启动\n\n` +
@@ -1578,6 +1670,23 @@ if (subcommand === 'migrate') {
   }
 }
 
+// ─── 连接模式：--connect ──────────────────────────────────────────────────────
+// Attaching to a Web Host someone else runs needs neither this machine's dsh
+// profile nor a local Agent, so it branches **before** the thin-shell delegation
+// below (a global shell would otherwise bootstrap a whole profile just to paste
+// a link) and before the dsh probe, kernel routing and workspace/resume
+// interception. A shell with no local `lib/` cannot run the entry: it falls
+// through, bootstraps once, and the profile copy — which does have `lib/` —
+// takes this same branch.
+const connectPlan = planConnectLaunch(process.argv.slice(2))
+const connectEntry = join(ownDir, 'lib', 'types', 'dsh-adapter', 'host-entry.js')
+if (connectPlan !== undefined && existsSync(connectEntry) && !process.argv.slice(2).some(isDshHostArg)) {
+  process.env.DSH_TUI_HOST_ENTRY ??= connectEntry
+  process.env.DSH_TUI_PROFILE ??= PROFILE
+  const result = await startEntrySession(connectEntry, process.argv.slice(2), withGuideSkillDir(process.env))
+  process.exit(result.kind === 'exit' ? result.code : result.kind === 'error' ? 1 : 0)
+}
+
 // ─── 全局副本：瘦壳角色 ───────────────────────────────────────────────────────
 // DSH_TUI_NO_DELEGATE=1 是测试/调试逃生口：强制走完整逻辑（verify-launcher
 // 的沙箱用它直接驱动全量路径；现场排查委托链时同样可用）。
@@ -1663,6 +1772,7 @@ if (!runningInsideProfile && ownVersion !== undefined && process.env.DSH_TUI_NO_
   // "each flag sets it, the last one wins" semantics — only a bare flag's
   // source depends on the backend, which may be named after it.
   const resumeFlags = []
+  let connectRequested = false
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === '--') {
@@ -1685,6 +1795,10 @@ if (!runningInsideProfile && ownVersion !== undefined && process.env.DSH_TUI_NO_
     }
     // `--backend <id>`: which agent backend the app opens its session with
     // (the row reads DSH_TUI_BACKEND; absent falls back to kernel.json, then dsh).
+    if (a === '--connect' || a.startsWith('--connect=')) {
+      connectRequested = true
+      continue
+    }
     if (a === '--backend' || a.startsWith('--backend=')) {
       const backend = a.startsWith('--backend=') ? a.slice('--backend='.length).trim() : (argv[i + 1] ?? '').trim()
       if (a === '--backend' && argv[i + 1] !== undefined) i += 1
@@ -1718,6 +1832,13 @@ if (!runningInsideProfile && ownVersion !== undefined && process.env.DSH_TUI_NO_
     } else {
       args.push(a)
     }
+  }
+
+  // `--connect` was validated (and its env set) by planConnectLaunch above the
+  // loop; a bare `--backend remote` reaches here and must not invent a Host.
+  if (!connectRequested && process.env.DSH_TUI_BACKEND === 'remote') {
+    console.error(lang === 'zh' ? 'remote 后端只能由 --connect 启动：请改用 dsh-tui --connect' : 'The remote backend starts only through --connect: use dsh-tui --connect')
+    process.exit(2)
   }
 
   // 按出现顺序重放 --resume：裸 --resume 时 DSH 读 resume.txt（契约不变），

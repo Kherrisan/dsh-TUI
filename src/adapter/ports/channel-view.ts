@@ -1225,8 +1225,18 @@ export interface ChannelCapabilities {
   readonly backendLabel: string
   /** Local slash-command names this backend supports (menu, Tab, dispatch). */
   readonly commands: readonly string[]
-  /** Queued inputs can be withdrawn synchronously (Alt+Up). */
+  /** The session has a command registry behind a request boundary (the remote
+   *  Host's). A slash line the local catalog does not own is handed to it
+   *  instead of becoming model text. */
+  readonly backendCommands: boolean
+  /** Queued inputs can be withdrawn (Alt+Up). Synchronous when the backend
+   *  owns its queue; the Host-confirmed path resolves asynchronously. */
   readonly retractPending: boolean
+  /** The backend can replace a queued submission's text in place (the Host's
+   *  own queue edit), so Alt+Up edits instead of retract-and-resend. */
+  readonly queueEdit: boolean
+  /** The backend can promote a queued submission to a steering one. */
+  readonly queueSteer: boolean
   readonly permissions: boolean
   readonly models: boolean
   readonly modelRoutes: 'backend' | 'providers'

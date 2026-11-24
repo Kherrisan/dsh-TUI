@@ -251,6 +251,15 @@ export function createInputDelivery(
       // row instead (#1651), sent only when the user sends the dock.
       if (!result.accepted) {
         if (attach !== undefined) attachedByMessageId.delete(message.id)
+        // "I refused" and "I may have taken it" are different: only a known
+        // refusal may hand the text back as a re-sendable draft. An unknown
+        // outcome keeps the row in place until the backend reconciles it
+        // against its own queue and durable log, so a lost receipt can never
+        // turn into a duplicate run.
+        if (result.outcome === 'unknown') {
+          notify(result.reason !== undefined && result.reason !== '' ? result.reason : t('input-outcome-unknown'), { color: 'warning', timeoutMs: 6000 })
+          return
+        }
         // A backend that is certain it never ran the input asks for it back
         // (`dropped`), like an ended session: keep the text as a dock row.
         const hold = result.dropped === true || origin.session.status === 'disposed'

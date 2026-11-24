@@ -66,6 +66,15 @@ export interface BackendGoalsHost {
  * rewind, resume, model switching, …). Implementations mutate internal state
  * and bump `version` so subscribed screens re-render.
  */
+/** How one retraction attempt ended. */
+export type PendingRetraction =
+  /** The row left the queue and its text is the user's again (safe to re-send). */
+  | 'retracted'
+  /** The row left the queue because the agent already took it (never re-send). */
+  | 'claimed'
+  /** The row is still queued (or its state is unknown): keep it on screen. */
+  | 'failed'
+
 export interface ChannelUi {
   /** Monotonic version — bump on every mutation so screens can re-render. */
   readonly version: number
@@ -421,6 +430,20 @@ export interface ChannelUi {
     images?: readonly ComposerImageRef[],
   ): Promise<ExternalCommandOutcome | undefined>
   /**
+   * Run one slash line through the bound session's OWN command registry (the
+   * remote Host's `commands/execute`). `undefined` means this backend has no
+   * such registry (the line is ordinary text); on a backend that has one, an
+   * unknown name settles as an error and the line is consumed, never sent to
+   * the model.
+   */
+  runBackendCommand(name: string, rawInput: string): Promise<ExternalCommandOutcome | undefined>
+  /**
+   * The Host's terminal inventory for this session, as report lines ready to
+   * print. `undefined` = this backend has no such inventory (the command
+   * reports that instead of pretending there are no terminals).
+   */
+  describeHostTerminals(): Promise<readonly string[] | undefined>
+  /**
    * Plugin-registered full-screen scene currently replacing the conversation
    * (the `dsh-tui-scenes` runtime), if any. The chat screen renders its
    * component INSTEAD of the transcript — the same whole-terminal treatment
@@ -522,8 +545,24 @@ export interface ChannelUi {
    * the next step boundary, the agent continues without aborting.
    */
   steer(text: string, images?: readonly ComposerImageRef[]): void
-  /** Pull a pending message back out of the inbox (Alt+Up) for re-editing. */
-  removePending(id: string): boolean
+  /**
+   * Pull a pending message back out of the inbox (Alt+Up) for re-editing.
+   * A backend whose queue lives in another process answers asynchronously
+   * (the Host owns the decision); the row is gone only when it resolves.
+   * `claimed` means the row retired because the agent already took it: its
+   * text is in the transcript, so the caller must not offer it for re-sending.
+   */
+  removePending(id: string): PendingRetraction | Promise<PendingRetraction>
+  /**
+   * Replace a queued submission's text in place, keeping its queue position.
+   * False when the backend cannot edit a live queue (retract and re-send).
+   */
+  editPending(id: string, text: string): boolean | Promise<boolean>
+  /**
+   * Promote a queued submission to a steering one, using the backend's own
+   * queue action. False when the backend has no such action.
+   */
+  steerPending(id: string): boolean | Promise<boolean>
   /** Abort the in-flight turn (`Ctrl+C` while working). While `cancelPending`
    *  stays true the abort has not converged; Chat force-exits on the next
    *  Ctrl+C press in that window. */

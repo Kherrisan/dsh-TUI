@@ -17,6 +17,7 @@ import { mentionFs } from '../mentions.js'
 import type { ChannelOwner } from '../owner.js'
 import { sessionWorkingDirectory } from '../../../channel/working-directory.js'
 import type { ChannelState, MentionFs } from '../types.js'
+import { sessionFilesFs } from '../session-files.js'
 import type { CoreHost } from './host.js'
 
 /** Argument catalogs the slash completion tree warms and reads. */
@@ -62,7 +63,11 @@ export function createCoreFiles(ctx: ServiceLookup, deps: {
   // no fs service and the backend runs here (mentions and `@` completion).
   const localFs = createLocalFs()
   const fallbackFs = (): MentionFs | undefined => deps.localFallback() ? localFs : undefined
-  const fs = (): MentionFs | undefined => mentionFs(ctx) ?? fallbackFs()
+  // A session that owns its files elsewhere (a remote Host) answers through
+  // its own capability: the local disk must never stand in for it, or `@`
+  // completion would list THIS machine's files for a Host path.
+  const sessionFs = (): MentionFs | undefined => sessionFilesFs(deps.binding.capture().session.capabilities.files)
+  const fs = (): MentionFs | undefined => mentionFs(ctx) ?? sessionFs() ?? fallbackFs()
   const fileActions = createFileActions({
     owner: deps.owner,
     capture: () => deps.binding.capture(),

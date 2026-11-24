@@ -37,6 +37,17 @@ const debugFailure = (what: string) => (error: unknown): void => {
   logForDebugging(`channel: ${what} failed (${error instanceof Error ? error.message : String(error)})`)
 }
 
+/**
+ * Local commands the session's own registry must answer once it publishes
+ * them: each one mutates session/agent state (compaction, the workspace's
+ * AGENTS.md, plan mode, the goal, the permission preset, a review turn), so
+ * running this process's version would act on the wrong process — or refuse
+ * outright because the local capability is absent on that backend.
+ */
+const HOST_OWNED_LOCAL_COMMANDS: ReadonlySet<string> = new Set([
+  'compact', 'init', 'plan', 'goal', 'permission', 'review',
+])
+
 export function createSessionControls(deps: {
   state: () => ChannelState
   /** The user-facing backend name the backend's own commands are tagged with. */
@@ -44,6 +55,9 @@ export function createSessionControls(deps: {
 }) {
   /** The backend's own commands, merged after the local ones. */
   let backendCommands: LocalCommand[] = []
+  /** The session runs commands in another process (the remote Host), so the
+   *  names its registry publishes outrank this process's local entries. */
+  let hostRegistry = false
   /** `/mcp` is synchronous: it reads the last report (refreshed per turn). */
   let mcpLines: string[] | undefined
   /** The servers of that report (`/mcp reconnect|toggle` completion). */
@@ -57,14 +71,22 @@ export function createSessionControls(deps: {
     // command the same way. Compare names case-insensitively, as completion does.
     const served = localCommandsFor(state.backendCapabilities.commands)
     const local = new Set([...LOCAL_COMMANDS.map(command => command.name), ...(served.includes(BACKEND_GOAL_COMMAND) ? [BACKEND_GOAL_COMMAND.name] : [])])
+    // A local implementation of a session-scoped command would act on THIS
+    // process, not on the process that owns the session: where the session's
+    // own registry publishes such a name (the remote Host's `/compact`), the
+    // registry's entry survives instead of being shadowed.
+    const yielded = (name: string): boolean => hostRegistry
+      && HOST_OWNED_LOCAL_COMMANDS.has(name)
+      && !served.some(command => command.name === name)
     state.commandList = backendCommands.length === 0
       ? served
-      : [...served, ...backendCommands.filter(command => !local.has(command.name.toLowerCase()))]
+      : [...served, ...backendCommands.filter(command => !local.has(command.name.toLowerCase()) || yielded(command.name.toLowerCase()))]
   }
 
   const loadBackendCommands = (session: AgentSession, current: () => boolean): void => {
     const commands = session.capabilities.commands
     if (commands === undefined) return
+    hostRegistry = commands.execute !== undefined
     void commands.list().then(list => {
       if (!current()) return
       backendCommands = list.map(command => ({

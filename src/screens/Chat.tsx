@@ -2805,6 +2805,35 @@ export function Chat({
    * asks for the block; errors always notify — they want the color and the
    * transient read.
    */
+  /**
+   * Run a slash line through the bound session's own registry (the remote
+   * Host's `commands/execute`). A backend without such a registry answers
+   * `undefined`, which keeps the line on the ordinary text path; a Host that
+   * does not know the name is reported and consumed, never sent to the model.
+   */
+  const runBackendCommand = (name: string, rawInput: string): Promise<boolean> => {
+    const originAgentBinding = channel.agentBindingGeneration
+    return channel.runBackendCommand(name, rawInput).then((outcome) => {
+      if (channel.agentBindingGeneration !== originAgentBinding) return false
+      // No backend registry: keep the legacy "send it to the model" path.
+      if (outcome === undefined) return false
+      const { lines, truncated } = cleanCommandReport(outcome.text)
+      if (truncated) lines.push(t('command-output-truncated'))
+      if (lines.length > 0) {
+        channel.pushLocal(`/${name}`, lines, { lineLimit: 65_536, preserveWhitespace: true })
+      }
+      if (outcome.kind === 'error') {
+        const cleaned = cleanRenderText(outcome.text, COMMAND_RESULT_CELLS)
+        if (cleaned !== '') channel.notify(cleaned, { color: 'error' })
+      }
+      return outcome.consumeDraft
+    }).catch((error: unknown) => {
+      if (channel.agentBindingGeneration !== originAgentBinding) return false
+      channel.notify(error instanceof Error ? error.message : String(error), { color: 'error', timeoutMs: 5000 })
+      return false
+    })
+  }
+
   const runExternalCommand = (
     name: string,
     rawInput: string,
@@ -3154,6 +3183,17 @@ export function Chat({
     images: readonly ComposerImageRef[] = [],
   ): boolean | Promise<boolean> => {
     if (refusedAtStartup(name)) return true
+    // A session whose commands run in another process (the remote Host) owns
+    // every name its registry publishes, including the ones this screen also
+    // implements locally: those local bodies act on THIS process — or fall
+    // through to the model because the local service is not mounted — while
+    // the Host has the agent that must perform them. DSH keeps its in-process
+    // registry path (its capability layer supplies no executor).
+    if (channel.backendCapabilities?.backendCommands === true
+      && channel.commandList.some(entry => entry.origin === 'backend' && entry.name === name)) {
+      setHelpOpen(false)
+      return runBackendCommand(name, rawInput)
+    }
     switch (name) {
       case 'activity': {
         // Ported from the pi working-activity extension: bare `/activity`
@@ -4039,6 +4079,19 @@ export function Chat({
         else channel.notify(t('agentsmd-created', { result }))
         return true
       }
+      case 'terminals': {
+        setHelpOpen(false)
+        void channel.describeHostTerminals().then((lines) => {
+          if (lines === undefined) {
+            channel.notify(t('capability-unavailable', { name: 'terminals', reason: t('terminals-readonly') }), { color: 'error' })
+            return
+          }
+          channel.pushLocal('/terminals', lines, { lineLimit: 65_536, preserveWhitespace: true })
+        }).catch((error: unknown) => {
+          channel.notify(error instanceof Error ? error.message : String(error), { color: 'error', timeoutMs: 5000 })
+        })
+        return true
+      }
       case 'jobs': {
         setHelpOpen(false)
         // Split mode routes to the side panel; narrow terminals keep the
@@ -4561,6 +4614,15 @@ export function Chat({
         if (external) {
           setHelpOpen(false)
           return runExternalCommand(name, rawInput, images, { report: true })
+        }
+        // A backend command (the remote Host's registry): the session owns
+        // the answer, including "no such command" — never the model.
+        const backend = channel.commandList.find(
+          command => command.origin === 'backend' && command.name === name,
+        )
+        if (backend !== undefined || channel.backendCapabilities?.backendCommands === true) {
+          setHelpOpen(false)
+          return runBackendCommand(name, rawInput)
         }
         return false
       }

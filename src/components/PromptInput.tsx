@@ -37,7 +37,8 @@ import type {
 } from '../dsh-adapter/channel.js'
 import type { TranscriptImage } from '../dsh-adapter/transcript-images.js'
 import type { TuiMentionHost } from '../dsh-adapter/mention-providers.js'
-import type { AttachedContext } from '../adapter/ports/channel-view.js'
+import type { AttachedContext, PendingMessage as PendingItem } from '../adapter/ports/channel-view.js'
+import type { PendingRetraction } from '../adapter/ports/channel-ui.js'
 import { isBootSafeCommand, isHiddenCommandName, isLocalCommandName, isUnavailableLocalCommand, parseCommandName, workingHoldOf } from '../commands.js'
 import { appendHistory, HISTORY_LIMIT, historyProjectKey, loadHistoryOldestFirst } from '../history.js'
 import { mentionAtCaret } from '../utils/mentions.js'
@@ -819,6 +820,16 @@ export function PromptInput({
    *  The ref mirrors it for the deferred consumeEscape controller closure. */
   const [dockSelected, setDockSelectedState] = React.useState<number | null>(null)
   const dockSelectedRef = React.useRef<number | null>(null)
+  /** The queued submission being edited in place on its owner's queue (null =
+   *  not editing). The row keeps its position; only its text changes. */
+  const [queueEditId, setQueueEditIdState] = React.useState<string | null>(null)
+  const queueEditIdRef = React.useRef<string | null>(null)
+  const setQueueEditId = (id: string | null): void => {
+    queueEditIdRef.current = id
+    setQueueEditIdState(id)
+  }
+  const queueEditTextRef = React.useRef<string | undefined>(undefined)
+  const queueEditPrevRef = React.useRef<string>('')
   const setDockSelected = (index: number | null): void => {
     dockSelectedRef.current = index
     setDockSelectedState(index)
@@ -1908,14 +1919,48 @@ export function PromptInput({
    */
   const pullBackLast = () => {
     // Alt+↑ keeps its direct last-item meaning even while the dock selector
-    // is open — one press, one retracted row (the selector closes with it).
+    // is open — one press, one row (the selector closes with it).
     setDockSelected(null)
     const item = channel.pending[channel.pending.length - 1]
     if (!item) return
-    if (!channel.removePending(item.id)) {
+    // In-place editing replaces the composer, so a real draft is never lost to
+    // it: that case keeps the retract-into-draft path (which swaps).
+    if (valueRef.current === '' && beginQueueEdit(item)) return
+    retractIntoDraft(item)
+  }
+
+  /**
+   * One retraction result, whichever side answered it. A Host-owned queue
+   * resolves later; `claimed` means the agent already took the message, so its
+   * text stays out of the composer (re-sending it would run it twice).
+   */
+  const applyRetraction = (item: PendingItem, result: PendingRetraction): void => {
+    if (result === 'failed') {
       channel.notify(t('input-cannot-retract'), { color: 'warning', timeoutMs: 2500 })
       return
     }
+    if (result === 'claimed') {
+      channel.notify(t('input-retract-claimed'), { color: 'warning', timeoutMs: 3000 })
+      return
+    }
+    restoreRetracted(item)
+  }
+
+  const awaitRetraction = (item: PendingItem, retracted: PendingRetraction | Promise<PendingRetraction>): void => {
+    if (typeof retracted === 'string') {
+      applyRetraction(item, retracted)
+      return
+    }
+    // A Host-owned queue answers asynchronously: only touch the composer once
+    // the owner confirmed it dropped its copy, or editing would race a run.
+    const sessionKey = String(channel.sessionId ?? channel.agentId)
+    void retracted.then(result => {
+      if (String(channel.sessionId ?? channel.agentId) !== sessionKey) return
+      applyRetraction(item, result)
+    })
+  }
+
+  const restoreRetracted = (item: PendingItem): void => {
     restageContexts(item.contexts)
     restoreDraftImages({
       text: item.text,
@@ -1926,6 +1971,89 @@ export function PromptInput({
     setSelectedCommand(0)
     setFileSelected(0)
     channel.notify(t('input-retracted'), { timeoutMs: 2000 })
+  }
+
+  const retractIntoDraft = (item: PendingItem): void => {
+    awaitRetraction(item, channel.removePending(item.id))
+  }
+
+  /**
+   * In-place edit of a queued (not parked) submission: the Host keeps the
+   * item and only its text changes, so the row keeps its queue position and
+   * nothing is re-sent. Enter commits the edit, Esc restores the draft; the
+   * text stays in the composer when the Host refuses, so an edit is never
+   * lost to a transport failure.
+   */
+  const beginQueueEdit = (item: PendingItem): boolean => {
+    if (item.docked === true) return false
+    if (channel.backendCapabilities?.queueEdit !== true) return false
+    setQueueEditId(item.id)
+    queueEditTextRef.current = item.text
+    queueEditPrevRef.current = valueRef.current
+    setInput(item.text, item.text.length, 'silent')
+    setSelectedCommand(0)
+    setFileSelected(0)
+    channel.notify(t('input-queue-editing'), { timeoutMs: 3000 })
+    return true
+  }
+
+  const finishQueueEdit = (ok: boolean, text: string): void => {
+    if (!ok) {
+      // The edit is not lost: the text stays in the composer for a retry.
+      channel.notify(t('input-queue-edit-failed'), { color: 'warning', timeoutMs: 4000 })
+      return
+    }
+    setQueueEditId(null)
+    queueEditTextRef.current = undefined
+    queueEditPrevRef.current = ''
+    if (valueRef.current === text) setInput('', 0, 'silent')
+    channel.notify(t('input-queue-edited'), { timeoutMs: 2000 })
+  }
+
+  /** Commit an in-place edit; a refusal keeps the draft for the user. */
+  const commitQueueEdit = (id: string, text: string): void => {
+    const editing = channel.editPending(id, text)
+    if (typeof editing === 'boolean') {
+      finishQueueEdit(editing, text)
+      return
+    }
+    const sessionKey = String(channel.sessionId ?? channel.agentId)
+    void editing.then(ok => {
+      if (String(channel.sessionId ?? channel.agentId) !== sessionKey) return
+      finishQueueEdit(ok, text)
+    })
+  }
+
+  /** Esc while editing: the queued item is untouched, the draft comes back. */
+  const cancelQueueEdit = (): void => {
+    const previous = queueEditPrevRef.current
+    setQueueEditId(null)
+    queueEditTextRef.current = undefined
+    queueEditPrevRef.current = ''
+    setInput(previous, previous.length, 'silent')
+  }
+
+  /** Promote the newest queued submission to a steering one (Host action). */
+  const steerQueued = (): void => {
+    if (channel.backendCapabilities?.queueSteer !== true) return
+    const item = [...channel.pending].reverse().find(candidate => candidate.docked !== true)
+    if (item === undefined) return
+    const steered = channel.steerPending(item.id)
+    const settle = (ok: boolean): void => {
+      channel.notify(ok ? t('input-queue-steered') : t('input-cannot-retract'), {
+        color: ok ? undefined : 'warning',
+        timeoutMs: ok ? 2500 : 2500,
+      })
+    }
+    if (typeof steered === 'boolean') {
+      settle(steered)
+      return
+    }
+    const sessionKey = String(channel.sessionId ?? channel.agentId)
+    void steered.then(ok => {
+      if (String(channel.sessionId ?? channel.agentId) !== sessionKey) return
+      settle(ok)
+    })
   }
 
   /**
@@ -1943,14 +2071,27 @@ export function PromptInput({
       if (item.text === text) target = item
     }
     if (target === undefined) return
-    if (channel.removePending(target.id)) {
-      // The text is back in the composer; its "send to Chat" contexts belong
-      // there too, or editing and resending drops the panel bodies.
-      restageContexts(target.contexts)
-      channel.notify(t('input-retracted'), { timeoutMs: 2000 })
-    } else {
-      channel.notify(t('input-cannot-retract'), { color: 'warning', timeoutMs: 2500 })
+    if (beginQueueEdit(target)) return
+    const retracted = channel.removePending(target.id)
+    const settle = (result: PendingRetraction): void => {
+      if (result === 'retracted') {
+        // The text is back in the composer; its "send to Chat" contexts belong
+        // there too, or editing and resending drops the panel bodies.
+        restageContexts(target.contexts)
+        channel.notify(t('input-retracted'), { timeoutMs: 2000 })
+        return
+      }
+      channel.notify(result === 'claimed' ? t('input-retract-claimed') : t('input-cannot-retract'), { color: 'warning', timeoutMs: result === 'claimed' ? 3000 : 2500 })
     }
+    if (typeof retracted === 'string') {
+      settle(retracted)
+      return
+    }
+    const sessionKey = String(channel.sessionId ?? channel.agentId)
+    void retracted.then(result => {
+      if (String(channel.sessionId ?? channel.agentId) !== sessionKey) return
+      settle(result)
+    })
   }
 
   /**
@@ -2019,20 +2160,7 @@ export function PromptInput({
       channel.notify(t('input-dock-swapped'), { timeoutMs: 2000 })
       return
     }
-    if (!channel.removePending(item.id)) {
-      channel.notify(t('input-cannot-retract'), { color: 'warning', timeoutMs: 2500 })
-      return
-    }
-    restageContexts(item.contexts)
-    restoreDraftImages({
-      text: item.text,
-      images: item.images ?? [],
-    })
-    setInput(item.text, item.text.length, 'silent')
-    updateFoldBlock(null)
-    setSelectedCommand(0)
-    setFileSelected(0)
-    channel.notify(t('input-retracted'), { timeoutMs: 2000 })
+    awaitRetraction(item, channel.removePending(item.id))
   }
 
   // A dock that empties or shrinks under an open selector (rows claimed,
@@ -2128,6 +2256,9 @@ export function PromptInput({
     // A built-in the bound backend does not serve is hidden from the menu and
     // Tab, and a typed one must neither run nor reach the model as text. A
     // partial embedder channel carries no snapshot: everything is served.
+    // The exception is a name the session's own registry publishes (the remote
+    // Host's `/compact`): the local implementation cannot act on that process,
+    // so the line is handed over instead of refused.
     // oxlint-disable-next-line typescript/no-unnecessary-condition -- partial embedder channels omit the snapshot
     const capabilities = channel.backendCapabilities as Channel['backendCapabilities'] | undefined
     if (command === undefined && isUnavailableLocalCommand(parsed.name, capabilities)) {
@@ -2140,7 +2271,13 @@ export function PromptInput({
     // A local command may be intentionally absent from the published catalog
     // (the service-gated `/team`): a typed name is still this app's command,
     // never text for the model. Backend-unavailable locals were refused above.
-    const known = command !== undefined || isHiddenCommandName(parsed.name) || isLocalCommandName(parsed.name)
+    // The session's own registry (the remote Host's) is the authority for a
+    // slash line it publishes elsewhere: hand the line over instead of letting
+    // it become model text. Without such a registry an unknown line stays
+    // ordinary text, exactly as before.
+    const hostOwned = command === undefined
+      && channel.backendCapabilities?.backendCommands === true
+    const known = command !== undefined || isHiddenCommandName(parsed.name) || isLocalCommandName(parsed.name) || hostOwned
     if (!known) return false
     const generation = syncImageGeneration()
     const revision = draftRevisionRef.current
@@ -2250,6 +2387,16 @@ export function PromptInput({
     if (now - lastEnterAtRef.current < 80) return
     lastEnterAtRef.current = now
     const value = valueRef.current
+    // An in-place queue edit owns Enter: commit the text to the queue owner
+    // instead of sending it as a new submission (the row keeps its position).
+    if (queueEditIdRef.current !== null) {
+      if (value.trim() === '') {
+        cancelQueueEdit()
+        return
+      }
+      commitQueueEdit(queueEditIdRef.current, value)
+      return
+    }
     // The docked-queue selector owns Enter while a row is highlighted and
     // the draft is untouched: retract that row into the input for editing.
     if (dockSelectedRef.current !== null && value.trim() === '' && dockCount > 0) {
@@ -2356,6 +2503,11 @@ export function PromptInput({
         refreshFileMenu(tick => tick + 1)
         return true
       }
+    }
+    // Esc leaves an in-place queue edit: the queued item was never touched.
+    if (queueEditIdRef.current !== null) {
+      cancelQueueEdit()
+      return true
     }
     // Esc leaves the docked-queue selector; the dock itself stays put
     // (⏎/↑ keep working afterwards).
@@ -3042,6 +3194,12 @@ export function PromptInput({
     if (key.meta && key.upArrow) {
       // Alt+Up: pull the last pending message back for editing (pi/Codex).
       pullBackLast()
+      return
+    }
+    if (key.meta && input === 's' && !key.ctrl) {
+      // Alt+S: promote the newest queued message to a steering one, using the
+      // queue owner's own action when it has one.
+      steerQueued()
       return
     }
     if (key.upArrow) {
@@ -4534,7 +4692,7 @@ export function PromptInput({
                   .filter(item => item.placement === 'steer' && item.docked !== true)
                   .map(item => (
                     <Text key={item.id} dimColor wrap="truncate">
-                      {'  '}↳ {item.text}
+                      {'  '}{queueEditId === item.id ? '✎' : '↳'} {item.text}
                     </Text>
                   ))}
               </Box>
@@ -4546,10 +4704,17 @@ export function PromptInput({
                   .filter(item => item.placement === 'followup' && item.docked !== true)
                   .map(item => (
                     <Text key={item.id} dimColor wrap="truncate">
-                      {'  '}↳ {item.text}
+                      {'  '}{queueEditId === item.id ? '✎' : '↳'} {item.text}
                     </Text>
                   ))}
               </Box>
+            )}
+            {(channel.backendCapabilities?.queueEdit === true || channel.backendCapabilities?.queueSteer === true) && (
+              <Text dimColor>
+                {channel.backendCapabilities.queueEdit === true ? t('input-pending-edit-hint') : ''}
+                {channel.backendCapabilities.queueEdit === true && channel.backendCapabilities.queueSteer === true ? ' · ' : ''}
+                {channel.backendCapabilities.queueSteer === true ? t('input-pending-steer-hint') : ''}
+              </Text>
             )}
             {dockCount > 0 && (
               <Box flexDirection="column">

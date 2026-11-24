@@ -143,12 +143,31 @@ export function createSessionBatchRouter(deps: {
     // it stays until sent (`deliverDocked`) or retracted. A claim always
     // retires the row: a fallback backend that kept its queue ran it.
     const dockedDiscards = new Set(event.discarded ?? [])
+    let changed = false
+    // The Host is authoritative for the live queue. A row this client did not
+    // submit (the browser, or another attached TUI) appears from `items`;
+    // rows still in flight locally are left alone until the Host claims them.
+    for (const item of event.items ?? []) {
+      const index = deps.state.pending.findIndex(pending => pending.id === item.id)
+      if (index === -1) {
+        deps.state.pending.push({ id: item.id, text: item.text, images: [], placement: item.placement })
+        changed = true
+        continue
+      }
+      const existing = deps.state.pending[index]!
+      if (existing.docked === true) continue
+      if (existing.text !== item.text || existing.placement !== item.placement) {
+        deps.state.pending[index] = { ...existing, text: item.text, placement: item.placement }
+        changed = true
+      }
+    }
     for (const messageId of [...event.claimed ?? [], ...event.discarded ?? []]) {
       const before = deps.state.pending.length
       deps.state.pending = deps.state.pending.filter(item =>
         item.id !== messageId || (item.docked === true && dockedDiscards.has(messageId)))
-      if (deps.state.pending.length !== before) deps.state.emit()
+      if (deps.state.pending.length !== before) changed = true
     }
+    if (changed) deps.state.emit()
   }
 
   /** Monotonic count of live turns that started on a bound session (`/new`

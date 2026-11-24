@@ -842,6 +842,11 @@ export function attachDshExtensions(
       () => externalCommands.invokeText(name, rawInput, images)),
     runExternalCommandOutcome: (name, rawInput, images) => trackPermissionCommand(name, rawInput,
       () => externalCommands.invoke(name, rawInput, images)),
+    // A DSH session resolves slash commands in-process, so the capability
+    // layer's Host-registry path never applies here.
+    runBackendCommand: () => Promise.resolve(undefined),
+    // DSH sessions use the local terminal panel; there is no Host inventory.
+    describeHostTerminals: () => Promise.resolve(undefined),
     mcpStatus: reportActions.mcpStatus,
     exportSession: reportActions.exportSession,
     initWorkspace: reportActions.initWorkspace,

@@ -10,7 +10,7 @@ import { spawn } from 'node:child_process'
 import { markBoot } from '../utils/bootTrace.js'
 import { configuredBackend, delegatesToProfile, entryKernel, hostProfile } from '../hostEntryRoute.js'
 import { HANDOFF_ACK_FD_ENV } from '../handoffAck.js'
-import { HOST_ENTRY_DELEGATED_ENV, HOST_NOTICE_ENV, type KernelBackendId } from '../kernelPrefs.js'
+import { HOST_ENTRY_DELEGATED_ENV, HOST_NOTICE_ENV, parseBackendId, type KernelBackendId } from '../kernelPrefs.js'
 import { logForDebugging } from '../utils/debug.js'
 import { setProcessName } from '../utils/processName.js'
 import { cmdEscapeArgument } from '../utils/shellQuote.js'
@@ -31,10 +31,22 @@ delete process.env[HOST_ENTRY_DELEGATED_ENV]
 // already open, the network section's reverse lookups block the event loop.
 if (process.report !== undefined) (process.report as { excludeNetwork?: boolean }).excludeNetwork = true
 const profile = hostProfile()
-const configured = configuredBackend(profile)
+// `--connect` is decided before the profile's backend row: it attaches to a
+// remote Host and must not start a local DSH Agent, whatever the row pins.
+const connectMode = process.env.DSH_TUI_CONNECT === '1' || process.argv.includes('--connect')
+if (connectMode) {
+  process.env.DSH_TUI_BACKEND = 'remote'
+  const flag = process.argv.indexOf('--connect')
+  if (flag !== -1) process.argv.splice(flag, 1)
+  const { prepareConnectLaunch } = await import('./connect-entry.js')
+  await prepareConnectLaunch()
+}
+// Connect mode pins the kernel before the profile row is consulted: nothing
+// local may run, and the handoff lives on the process global, not in the row.
+const configured = connectMode ? parseBackendId('remote') : configuredBackend(profile)
 // A `!!js` backend is evaluated only by the profile's Loader: that launch
 // keeps the full `dsh --profile` path, which honours the evaluated row.
-if (delegatesToProfile(configured)) delegateToDsh()
+if (!connectMode && delegatesToProfile(configured)) delegateToDsh()
 else await runInEntry(entryKernel(process.env, { configured }))
 
 /** bin/dsh-tui.js `MSG.noDsh`, newline-terminated. */
@@ -129,16 +141,22 @@ async function runInEntry(kernelBeforeHost: KernelBackendId): Promise<void> {
     markBoot('entry-hijacked')
   } catch (error) {
     markBoot('entry-host-unavailable')
-    // No dsh at all: stop with the install guidance rather than delegate into
-    // a spawn failure (on Windows `shell: true` hides the ENOENT).
-    if (kernelBeforeHost === 'dsh' && error instanceof Error && error.message === NO_DSH_ON_PATH) {
+    // Connect mode reads its Host over HTTP/WebSocket and mounts no DSH service:
+    // a missing or partial local dsh is not a limitation to report, and the
+    // launch must not fall back to `dsh --profile`.
+    if (connectMode) {
+      // Fall through to this package's own root below.
+    } else if (kernelBeforeHost === 'dsh' && error instanceof Error && error.message === NO_DSH_ON_PATH) {
+      // No dsh at all: stop with the install guidance rather than delegate into
+      // a spawn failure (on Windows `shell: true` hides the ENOENT).
       process.stderr.write(noDshGuidance())
       process.exit(1)
-    }
-    noteHostUnavailable(kernelBeforeHost, error)
-    if (kernelBeforeHost === 'dsh') {
-      delegateToDsh()
-      return
+    } else {
+      noteHostUnavailable(kernelBeforeHost, error)
+      if (kernelBeforeHost === 'dsh') {
+        delegateToDsh()
+        return
+      }
     }
   }
   const [{ Config }, { apply, handleStartupError }, { assembleBackendsFromProfile }, { createEntrySlot }, { deferRootCapabilityGuard, armRootCapabilityGuard }, { processGuardActive }, { logRestartEvent }] = await Promise.all([
@@ -186,6 +204,9 @@ async function runInEntry(kernelBeforeHost: KernelBackendId): Promise<void> {
     ...(env.DSH_TUI_WORKSPACE_TARGET === undefined ? {} : { workspace: env.DSH_TUI_WORKSPACE_TARGET }),
     ...(env.DSH_TUI_RESUME_SESSION === undefined ? {} : { sessionId: env.DSH_TUI_RESUME_SESSION }),
     ...(env.DSH_TUI_BACKEND === undefined ? {} : { backend: env.DSH_TUI_BACKEND as TuiConfig['backend'] }),
+    // Connect mode otherwise inherits the entry row's fullscreen default, and
+    // inline is a legitimate way to attach (same as any other launch).
+    ...(env.DSH_TUI_FULLSCREEN === undefined ? {} : { fullscreen: env.DSH_TUI_FULLSCREEN !== '0' }),
   })
   installEntrySignals({
     seam: exitSeam,

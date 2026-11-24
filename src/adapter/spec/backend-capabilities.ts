@@ -20,6 +20,7 @@
  */
 export const BACKEND_CAPABILITY_NAMES: readonly string[] = Object.freeze([
   'pendingRetraction',
+  'pendingQueue',
   'permissions',
   'questions',
   'models',

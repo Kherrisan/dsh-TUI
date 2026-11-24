@@ -1,6 +1,7 @@
 /** Input actions own cancellation/requeue convergence, not session binding. */
 import { randomUUID } from 'node:crypto'
 import type { AgentSession, CancelOutcome } from '../../agent/session.js'
+import type { PendingRetraction } from '../../adapter/ports/channel-ui.js'
 import { t } from '../../i18n.js'
 import { touchSession } from '../../sessionHistory.js'
 import type { AttachedContext, ChannelState, ComposerImageRef, ComposerSubmission, PendingMessage } from './types.js'
@@ -41,7 +42,7 @@ export function createInputActions(
   /** Move the used session to the front of the `/resume` MRU (DSH session
    *  history); a backend whose sessions that list cannot open passes a no-op. */
   touch: (sessionId: string) => void = touchSession,
-): Pick<ChannelState, 'submit' | 'steer' | 'removePending' | 'cancel' | 'interruptAndDeliver' | 'interruptAndDock' | 'deliverDocked' | 'swapDockedForDraft' | 'holdInputs'> {
+): Pick<ChannelState, 'submit' | 'steer' | 'removePending' | 'editPending' | 'steerPending' | 'cancel' | 'interruptAndDeliver' | 'interruptAndDock' | 'deliverDocked' | 'swapDockedForDraft' | 'holdInputs'> {
   return {
     submit(text, images = []) {
       owner.assertActive()
@@ -93,12 +94,12 @@ export function createInputActions(
 
     /** Pull a pending message back out of the inbox (Alt+Up): it returns to
      *  the input for editing instead of being delivered. */
-    removePending(id: string): boolean {
+    removePending(id: string): PendingRetraction | Promise<PendingRetraction> {
       owner.assertActive()
       const state = getState()
       const session = getSession()
       const index = state.pending.findIndex(item => item.id === id)
-      if (index === -1) return false
+      if (index === -1) return 'failed'
       // A docked preview is a channel-side asset: the backend dropped its
       // queued copy with the aborted turn, so pulling it back is purely
       // local and works on every backend, including backends without
@@ -108,18 +109,69 @@ export function createInputActions(
         // its backend copy may still run, so editing the row out now would
         // strand a copy the late revocation can no longer reach. The caller
         // keeps the row queued and says it cannot be retracted.
-        if (input.provisionalDockIds?.includes(id) === true) return false
+        if (input.provisionalDockIds?.includes(id) === true) return 'failed'
         state.pending = state.pending.filter(item => item.id !== id)
         state.emit()
-        return true
+        return 'retracted'
+      }
+      // The Host owns its queue: the preview may only go away once the owner
+      // answered. Returning a promise keeps the row on screen until then, so a
+      // refusal (or a lost receipt) never looks like a successful retraction.
+      const queue = session.capabilities.pendingQueue
+      if (queue !== undefined) {
+        return queue.remove(id).then((outcome): PendingRetraction => {
+          if (outcome.kind === 'rejected' || outcome.kind === 'unknown') return 'failed'
+          state.pending = state.pending.filter(item => item.id !== id)
+          state.emit()
+          // `gone` with proof that it ran: the row retires, but its text now
+          // lives in the transcript, so it is never offered for re-sending.
+          return outcome.kind === 'gone' && outcome.claimed === true ? 'claimed' : 'retracted'
+        }, () => 'failed')
       }
       const retraction = session.capabilities.pendingRetraction
-      if (retraction === undefined) return false
+      if (retraction === undefined) return 'failed'
       const removed = retraction.remove(id)
-      if (!removed) return false
+      if (!removed) return 'failed'
       state.pending = state.pending.filter(item => item.id !== id)
       state.emit()
-      return true
+      return 'retracted'
+    },
+
+    /** In-place queue edits the Host offers (`session/updateQueue`): keep the
+     *  submission's position instead of retracting and re-sending it. */
+    editPending(id: string, text: string): boolean | Promise<boolean> {
+      owner.assertActive()
+      const session = getSession()
+      const edit = session.capabilities.pendingQueue?.edit
+      if (edit === undefined) return false
+      const state = getState()
+      return edit(id, text).then(outcome => {
+        if (outcome.kind === 'rejected' || outcome.kind === 'unknown') return false
+        const index = state.pending.findIndex(item => item.id === id)
+        if (index !== -1) {
+          state.pending[index] = { ...state.pending[index]!, text }
+          state.emit()
+        }
+        return true
+      }, () => false)
+    },
+
+    /** Promote a queued submission to a steering one (the Host's own action). */
+    steerPending(id: string): boolean | Promise<boolean> {
+      owner.assertActive()
+      const session = getSession()
+      const steer = session.capabilities.pendingQueue?.steer
+      if (steer === undefined) return false
+      const state = getState()
+      return steer(id).then(outcome => {
+        if (outcome.kind === 'rejected' || outcome.kind === 'unknown') return false
+        const index = state.pending.findIndex(item => item.id === id)
+        if (index !== -1) {
+          state.pending[index] = { ...state.pending[index]!, placement: 'steer' }
+          state.emit()
+        }
+        return true
+      }, () => false)
     },
 
     cancel() {
@@ -245,7 +297,12 @@ export function createInputActions(
         }
         // The unconfirmed legs are loud: a failed or answerless interrupt
         // must not leave a success-shaped dock (or a silently failed Esc).
+        // A confirmed receipt that keeps rows in the owner's queue is not a
+        // failure: say where they are (they run after the aborted turn) instead
+        // of implying the interrupt could not be confirmed.
+        const keptQueued = outcome === 'confirmed' && stillQueued.length > 0 && uncovered.length === 0
         const notice = outcome === 'failed' ? t('interrupt-failed')
+          : keptQueued ? t('input-stop-queue-kept')
           : revoke.size === 0 ? undefined
           : t('interrupt-unconfirmed')
         if (notice !== undefined) state.notify(notice, { color: 'warning', timeoutMs: 6000 })

@@ -38,6 +38,9 @@ import { installExecutor } from './install/executors.js'
 
 export { isBackendIdSyntax }
 
+/** The in-tree attach backend's id, kept here so the picker filter needs no import. */
+const REMOTE_BACKEND_ID = 'remote'
+
 /**
  * The DSH kernel. In-tree and always available, but **not** an `AgentBackend`:
  * its session is built by `createDshSession()` from the DSH agent, and P0 does
@@ -244,7 +247,12 @@ export function listBackends(): readonly RegisteredBackend[] {
  * shape exists so the C stage's grant flow has somewhere to land.
  */
 export function listOfferedBackends(): readonly RegisteredBackend[] {
-  return listBackends().filter(entry => entry.admission.decision !== 'waiting_authorization')
+  return listBackends().filter(entry =>
+    entry.admission.decision !== 'waiting_authorization'
+    // `remote` attaches to someone else's Web Host, so it is only a real choice
+    // when `--connect` already read the launch link. Offering it in an ordinary
+    // launch would open a picker row that can only fail.
+    && !(entry.id === REMOTE_BACKEND_ID && process.env.DSH_TUI_CONNECT !== '1'))
 }
 
 /**

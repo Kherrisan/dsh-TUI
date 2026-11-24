@@ -72,8 +72,14 @@ export function channelCapabilities(input: {
       // The typed `goals` capability serves /goal the same way
       // (BACKEND_GOAL_COMMAND); DSH keeps its registry-row command.
       ...(input.dsh || caps.goals === undefined ? [] : ['goal']),
+      // The typed `terminals` capability serves /terminals: the Host owns the
+      // terminals, so a backend without that inventory never shows the command.
+      ...(caps.terminals === undefined ? [] : ['terminals']),
     ]),
-    retractPending: caps.pendingRetraction !== undefined,
+    backendCommands: caps.commands?.execute !== undefined,
+    retractPending: caps.pendingRetraction !== undefined || caps.pendingQueue !== undefined,
+    queueEdit: caps.pendingQueue?.edit !== undefined,
+    queueSteer: caps.pendingQueue?.steer !== undefined,
     ...flags,
   })
 }

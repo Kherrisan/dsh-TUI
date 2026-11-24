@@ -166,9 +166,85 @@ export interface SessionAuthView {
   readonly lines: readonly string[]
 }
 
+/**
+ * What the queue's owner did with one mutation. `unknown` is not a refusal:
+ * the request left this client and no receipt arrived, so the row may still be
+ * live on the other side and must not be treated as withdrawn or re-sendable.
+ */
+export type QueueMutationOutcome =
+  | { readonly kind: 'accepted' }
+  /** The owner no longer holds that row. `claimed` reports durable proof that
+   *  it became a message (it ran), so its text is already the agent's and must
+   *  never come back as a re-sendable draft. Without that proof the row simply
+   *  left the queue. */
+  | { readonly kind: 'gone'; readonly claimed?: true }
+  | { readonly kind: 'rejected'; readonly reason: string }
+  | { readonly kind: 'unknown'; readonly reason: string }
+
+/** What a session's own command registry did with one slash line. */
+export type CommandRunOutcome =
+  /** The registry ran it; `text` is the handler's report ('' = silent). */
+  | { readonly kind: 'settled'; readonly text: string; readonly error?: true }
+  /** The registry has no such command (the caller must not send it to the model). */
+  | { readonly kind: 'unknown' }
+  /** The request never reached a decision (transport, permission, refusal). */
+  | { readonly kind: 'failed'; readonly reason: string }
+
+/** One terminal the Host owns for this session (read-only inventory). */
+export interface HostTerminalInfo {
+  readonly id: string
+  readonly title: string
+  readonly state: 'running' | 'exited' | 'failed'
+  readonly cwd: string
+  readonly cols: number
+  readonly rows: number
+  /** Who created it: the person (`user`) or the agent's own tool (`agent`). */
+  readonly origin: 'user' | 'agent'
+  readonly exitCode?: number | null
+}
+
+/** The Host's terminal limits and current directory. */
+export interface HostTerminalEnvironment {
+  readonly cwd: string
+  readonly maxCols: number
+  readonly maxRows: number
+  readonly scrollback: number
+}
+
+/**
+ * The session's own file scope, served by the process that owns its working
+ * directory (a remote Host). Paths are workspace-relative with `/` separators
+ * and `''` for the root; nothing here may silently read THIS process's disk.
+ */
+export interface SessionFiles {
+  /** The Host directory those relative paths resolve against. */
+  readonly root: string
+  list(path: string): Promise<{
+    readonly path: string
+    readonly entries: readonly { readonly name: string; readonly type: 'file' | 'directory' | 'other' }[]
+  }>
+  /** `undefined` when the path does not resolve (the caller reports a miss). */
+  stat(path: string): Promise<{ readonly type: 'file' | 'directory' | 'other'; readonly absolutePath?: string } | undefined>
+  /** One page of a text file; the Host owns the page size and the cut. */
+  readText(path: string): Promise<{ readonly text: string; readonly eof: boolean }>
+}
+
 /** Every optional capability of one live session. */
 export interface SessionCapabilities {
   readonly pendingRetraction?: { remove(clientMessageId: string): boolean }
+  /**
+   * A queue whose authority is another process (the Host). Every mutation is
+   * answered by that process, so the preview may only be retired after a
+   * receipt — `pendingRetraction` above is for backends that can answer
+   * synchronously from their own memory.
+   */
+  readonly pendingQueue?: {
+    remove(clientMessageId: string): Promise<QueueMutationOutcome>
+    /** Replace the queued text in place, keeping its position. */
+    edit?(clientMessageId: string, text: string): Promise<QueueMutationOutcome>
+    /** Promote a queued submission to a steering one. */
+    steer?(clientMessageId: string): Promise<QueueMutationOutcome>
+  }
   readonly permissions?: {
     respond(requestId: string, decision: PermissionDecision): void
     pending(): readonly PermissionRequestView[]
@@ -336,8 +412,27 @@ export interface SessionCapabilities {
    * to `submit` as `AgentInput.images`, in block order.
    */
   readonly images?: { readonly limits: ImageLimitsView }
+  /**
+   * The Host's terminal inventory for this session: listing only — attach,
+   * output and input are deliberately absent (see the stage-5 report).
+   */
+  readonly terminals?: {
+    list(): Promise<readonly HostTerminalInfo[]>
+    environment(): Promise<HostTerminalEnvironment | undefined>
+    shells(): Promise<readonly { readonly name: string; readonly path: string }[]>
+  }
+  /** Files of the session's own working directory (see SessionFiles). */
+  readonly files?: SessionFiles
   readonly commands?: {
     list(): Promise<readonly CommandInfo[]>
+    /**
+     * Run one complete slash line (`/plan on`) through this session's own
+     * command registry. Present only where the registry exists behind a
+     * request boundary (the remote Host): a backend that resolves commands
+     * in-process keeps the ordinary text path, and the composer only reaches
+     * here for a line the catalog does not already own locally.
+     */
+    execute?(line: string): Promise<CommandRunOutcome>
   }
   readonly context?: { usage(detail: 'summary' | 'full'): Promise<ContextUsageView> }
   readonly account?: { info(): Promise<AccountView> }

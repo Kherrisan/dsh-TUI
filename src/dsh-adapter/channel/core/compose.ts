@@ -311,7 +311,9 @@ export function createCoreChannel(
     binding,
     state: () => state,
     host,
-    localFallback: () => extension.localFs !== false,
+    // A session that serves its own files (a remote Host) must never be
+    // answered from this machine's disk.
+    localFallback: () => extension.localFs !== false && binding.session.capabilities.files === undefined,
     // Read late: the session controls are built after the files.
     mcpServers: () => controls.mcpServers(),
   })
